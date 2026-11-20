@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -51,14 +52,25 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
+    # Canonicalize Unicode: remove zero-width spaces, soft hyphens, and invisible formatting
+    normalized = re.sub(r"[\u200b-\u200f\ufeff\u2060\u00ad]", "", user_input)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore\s+(?:all\s+)?(?:previous|above|prior)\s+(?:instructions|prompts|rules|commands)",
+        r"ignore\s+all\s+instructions",
+        r"you\s+are\s+now(?:\s+(?:a|an))?\s+\w+",
+        r"system\s+prompt",
+        r"(?:reveal|show|display|print|leak|output|dump)\s+(?:(?:your|the|internal)\s+)*(?:system\s+)?(?:instructions|prompt|passwords?|secrets?|keys?)",
+        r"pretend\s+(?:that\s+)?you\s+are",
+        r"act\s+as\s+(?:a\s+|an\s+)?unrestricted",
+        r"bypass\s+(?:all\s+)?(?:guardrails|filters|restrictions|safety)",
+        r"do\s+anything\s+now",
+        r"jailbreak",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -74,6 +86,13 @@ def detect_injection(user_input: str) -> InputStatus:
 # Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
 
+def _remove_vietnamese_accents(text: str) -> str:
+    """Normalize Vietnamese diacritics for flexible matching."""
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return text.replace("đ", "d").replace("Đ", "D")
+
+
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
 
@@ -84,14 +103,30 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
+    if not user_input or not user_input.strip():
+        return "BLOCK"
+
     input_lower = user_input.lower()
+    input_unaccented = _remove_vietnamese_accents(input_lower)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Check blocked topics
+    for topic in BLOCKED_TOPICS:
+        pattern = r"\b" + re.escape(topic)
+        if re.search(pattern, input_lower) or re.search(pattern, input_unaccented):
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. Check allowed topics (must contain at least one banking keyword)
+    has_allowed = False
+    for topic in ALLOWED_TOPICS:
+        pattern = r"\b" + re.escape(topic)
+        if re.search(pattern, input_lower) or re.search(pattern, input_unaccented):
+            has_allowed = True
+            break
+
+    if not has_allowed:
+        return "BLOCK"
+
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +179,18 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 1. Check prompt injection
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response("Request blocked: prompt injection detected.")
 
-        pass  # Replace with your implementation
+        # 2. Check topic filter
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response("Request blocked: query is off-topic for VinBank.")
+
+        # 3. Safe message, pass through
+        return None
 
 
 # ============================================================
